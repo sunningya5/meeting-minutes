@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Models (downloaded at runtime)
+model/
+models/
+*.pth
+*.bin
+*.onnx
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Gradio
+gradio_cached_examples/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env files
+.env
+.env.local
