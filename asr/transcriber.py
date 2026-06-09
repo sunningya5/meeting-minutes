@@ -135,6 +135,53 @@ def transcribe_stream(audio_path: str) -> Generator[str, None, None]:
                 pass
 
 
+def transcribe_progress(audio_path: str, progress_start: float = 0.2, progress_end: float = 0.65):
+    """
+    带进度的流式转写 — 每完成一段就 yield 一次进度
+    用于 Gradio 实时进度条更新
+
+    yield: (progress_value, segment_text, status_message)
+    """
+    model = _load_model()
+    y, sr = load_and_resample(audio_path)
+    segments = split_audio(y, sr)
+    total = len(segments)
+    logger.info(f"音频分为 {total} 段处理")
+
+    all_texts = []
+    progress_range = progress_end - progress_start
+
+    for i, seg in enumerate(segments):
+        wav_path = save_temp_wav(seg, sr)
+        try:
+            result = model.generate(
+                input=wav_path,
+                language="zh",
+                use_itn=True,
+                batch_size_s=60,
+            )
+            text = ""
+            if result and len(result) > 0:
+                text = result[0].get("text", "").strip()
+            if text:
+                all_texts.append(text)
+        except Exception as e:
+            logger.error(f"第 {i+1}/{total} 段失败: {e}")
+        finally:
+            import os
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+        # 实时更新进度
+        progress = progress_start + ((i + 1) / total) * progress_range
+        status = f"[...] 转写中: 第 {i+1}/{total} 段完成"
+        yield progress, "\n".join(all_texts), status
+
+    logger.info(f"转写完成, 共 {total} 段")
+
+
 def get_model_info() -> str:
     """返回 ASR 模型信息"""
     config = get_config()

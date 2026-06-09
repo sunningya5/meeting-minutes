@@ -49,13 +49,13 @@ logger = logging.getLogger("meeting-minutes")
 # ============================================================
 def process_meeting(audio_file, progress=gr.Progress()):
     """
-    完整处理流程: 上传 → 校验 → 转写 → 总结
+    完整处理流程: 上传 → 校验 → 转写(实时进度) → 总结
     """
     if audio_file is None:
         yield "", "", "[WARN] 请先上传 MP3 录音文件"
         return
 
-    # --- Step 1: 校验 ---
+    # --- Step 1: 校验 (0% - 10%) ---
     progress(0.0, desc="校验音频文件...")
     is_valid, err_msg = validate_audio(audio_file)
     if not is_valid:
@@ -65,43 +65,51 @@ def process_meeting(audio_file, progress=gr.Progress()):
     file_size_mb = os.path.getsize(audio_file) / (1024 * 1024)
     status = f"[OK] 文件已上传 ({file_size_mb:.1f} MB)\n"
 
-    # --- Step 2: ASR 转写 ---
-    progress(0.1, desc="加载 ASR 模型 (首次需下载 ~893MB)...")
+    # --- Step 2: 加载模型 (10% - 15%) ---
+    progress(0.10, desc="加载 ASR 模型...")
     status += "[...] 正在转写音频..."
 
     try:
-        from asr.transcriber import transcribe
+        from asr.transcriber import transcribe_progress
 
-        progress(0.2, desc="语音转文字中...")
-        transcript = transcribe(audio_file)
+        # --- Step 3: ASR 分段转写 (15% - 65%) 实时推进 ---
+        transcript = ""
+        for seg_progress, partial_text, seg_status in transcribe_progress(
+            audio_file, progress_start=0.15, progress_end=0.65
+        ):
+            progress(seg_progress, desc="语音转文字中...")
+            transcript = partial_text
+            # 实时显示已转写的文本
+            yield transcript, "", status + f"\n{seg_status}"
 
         if not transcript.strip():
             yield "", "", status + "\n[WARN] 转写结果为空，请检查音频是否有有效语音内容"
             return
 
         word_count = len(transcript)
-        status += f"\n[OK] 转写完成 ({word_count} 字)"
+        status = f"{status}\n[OK] 转写完成 ({word_count} 字)"
 
     except Exception as e:
         logger.exception("ASR 转写失败")
         yield "", "", status + f"\n[FAIL] 转写失败: {e}"
         return
 
-    # --- Step 3: LLM 总结 ---
-    progress(0.7, desc="DeepSeek 生成会议纪要...")
-    status += "\n[...] 正在调用 DeepSeek 生成智能摘要..."
+    # --- Step 4: LLM 总结 (65% - 95%) ---
+    progress(0.65, desc="DeepSeek 生成会议纪要...")
+    status += "\n[...] DeepSeek 正在生成智能摘要..."
 
     try:
         from llm.summarizer import summarize, check_llm_available
 
         llm_ok, llm_msg = check_llm_available()
+        progress(0.75, desc="AI 生成中...")
 
         if llm_ok:
             summary = summarize(transcript)
             status += f"\n[OK] 智能摘要生成完毕 ({llm_msg})"
             status += f"\n[INFO] 转写字数: {word_count} | 总结字数: {len(summary)}"
         else:
-            summary = summarize(transcript)  # 走兜底
+            summary = summarize(transcript)
             status += f"\n[WARN] {llm_msg}"
             status += "\n[INFO] 已使用离线模式展示转写结果"
 
