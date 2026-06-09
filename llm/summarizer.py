@@ -1,202 +1,311 @@
 """
 LLM 总结模块
-通过 Ollama 调用本地大语言模型，生成会议纪要
+优先使用 DeepSeek API (V4 Pro)，Ollama 本地模型作为兜底
 """
 
 import logging
+import json
 from typing import Optional, Generator
 
-import ollama
+import requests
 
 from config import get_config
 from prompts.templates import build_summary_prompt, build_title_prompt
 
 logger = logging.getLogger(__name__)
 
+# DeepSeek API 兼容 OpenAI 格式
+DEEPSEEK_CHAT_URL = "https://api.deepseek.com/v1/chat/completions"
 
-def check_ollama_available() -> tuple[bool, str]:
+
+# ============================================================
+# DeepSeek API (主方案)
+# ============================================================
+def _call_deepseek_api(messages: list, stream: bool = False) -> Optional[str]:
     """
-    检查 Ollama 服务是否可用
-    返回: (是否可用, 状态信息)
+    调用 DeepSeek API (OpenAI 兼容接口)
+    返回: 回复文本，失败返回 None
     """
     config = get_config()
+    api_key = config.deepseek_api_key
+
+    if not api_key:
+        logger.warning("DeepSeek API Key 未设置")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": config.deepseek_model,
+        "messages": messages,
+        "temperature": config.llm_temperature,
+        "max_tokens": config.llm_max_tokens,
+        "stream": stream,
+    }
+
     try:
-        client = ollama.Client(host=config.ollama_host)
-        models_response = client.list()
-        models = [m.get("name", "") for m in models_response.get("models", [])]
-        if not models:
-            return False, "Ollama 运行中，但没有已安装的模型。请运行: ollama pull deepseek-r1:8b"
-        return True, f"Ollama 可用，已有模型: {', '.join(models[:5])}"
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=config.llm_timeout,
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        elif resp.status_code == 401:
+            logger.error("DeepSeek API Key 无效 (401)")
+            return None
+        elif resp.status_code == 429:
+            logger.warning("DeepSeek API 频率限制 (429), 请稍后重试")
+            return None
+        else:
+            logger.error(f"DeepSeek API 错误 ({resp.status_code}): {resp.text[:200]}")
+            return None
+
+    except requests.Timeout:
+        logger.error("DeepSeek API 请求超时")
+        return None
     except Exception as e:
-        return False, f"Ollama 连接失败 ({e})。请确保 Ollama 已启动: ollama serve"
+        logger.error(f"DeepSeek API 调用失败: {e}")
+        return None
 
 
-def find_best_model() -> Optional[str]:
-    """
-    自动查找最优的可用模型
-    按 candidate_models 优先级匹配
-    """
+def _call_deepseek_api_stream(messages: list) -> Generator[str, None, None]:
+    """流式调用 DeepSeek API"""
+    config = get_config()
+    api_key = config.deepseek_api_key
+
+    if not api_key:
+        yield "[ERROR] DeepSeek API Key 未设置"
+        return
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": config.deepseek_model,
+        "messages": messages,
+        "temperature": config.llm_temperature,
+        "max_tokens": config.llm_max_tokens,
+        "stream": True,
+    }
+
+    try:
+        resp = requests.post(
+            DEEPSEEK_CHAT_URL,
+            headers=headers,
+            json=payload,
+            timeout=config.llm_timeout,
+            stream=True,
+        )
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8")
+            if line_str.startswith("data: "):
+                data_str = line_str[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                except json.JSONDecodeError:
+                    continue
+
+    except Exception as e:
+        yield f"\n[ERROR] DeepSeek API 调用失败: {e}"
+
+
+def check_deepseek_available() -> tuple[bool, str]:
+    """检查 DeepSeek API 是否可用"""
+    config = get_config()
+    if config.deepseek_api_key:
+        return True, f"DeepSeek API 已配置 (模型: {config.deepseek_model})"
+    return False, "DeepSeek API Key 未设置"
+
+
+# ============================================================
+# Ollama (兜底方案)
+# ============================================================
+def _check_ollama() -> Optional[str]:
+    """检查 Ollama 并返回最优可用模型名"""
     config = get_config()
     try:
+        import ollama
         client = ollama.Client(host=config.ollama_host)
-        models_response = client.list()
-        available = set()
-        for m in models_response.get("models", []):
-            name = m.get("name", "")
-            available.add(name)
-            # 也记录去掉 :latest 后缀的名字
-            if ":" in name:
-                base = name.split(":")[0]
-                available.add(base)
+        models_resp = client.list()
+        available = {m.get("name", "") for m in models_resp.get("models", [])}
 
-        # 按优先级匹配
         for candidate in config.candidate_models:
             if candidate in available:
                 return candidate
-            # 尝试匹配基础名（如 qwen3 匹配 qwen3:4b）
             base = candidate.split(":")[0]
-            for avail_name in available:
-                if avail_name.startswith(base):
-                    return avail_name
-
-        # 兜底：返回第一个可用模型
+            for name in available:
+                if name.startswith(base):
+                    return name
         if available:
             return list(available)[0]
-
     except Exception as e:
-        logger.warning(f"查找模型失败: {e}")
+        logger.warning(f"Ollama 检测失败: {e}")
     return None
 
 
-def summarize(transcript: str) -> str:
-    """
-    调用本地 LLM 生成会议纪要
-
-    参数:
-        transcript: ASR 转写文本
-    返回:
-        格式化的会议纪要 (Markdown)
-    """
+def _call_ollama(model: str, messages: list) -> Optional[str]:
+    """调用 Ollama 本地模型"""
     config = get_config()
-    model = find_best_model()
-
-    if not model:
-        return _fallback_summary(transcript, "未找到可用的 Ollama 模型")
-
-    prompt = build_summary_prompt(transcript)
-
     try:
+        import ollama
         client = ollama.Client(host=config.ollama_host)
         response = client.chat(
             model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个专业的会议纪要助手，擅长从会议转写中提取关键信息并生成结构化纪要。请始终用中文回复。"
-                },
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             options={
                 "temperature": config.llm_temperature,
                 "num_predict": config.llm_max_tokens,
             },
         )
         return response["message"]["content"]
-
     except Exception as e:
-        logger.error(f"LLM 调用失败: {e}")
-        return _fallback_summary(transcript, f"LLM 服务异常: {e}")
+        logger.error(f"Ollama 调用失败: {e}")
+        return None
+
+
+# ============================================================
+# 统一接口
+# ============================================================
+def summarize(transcript: str) -> str:
+    """
+    生成会议纪要
+    优先使用 DeepSeek API，不可用时使用 Ollama，再不行用离线兜底
+    """
+    config = get_config()
+    prompt = build_summary_prompt(transcript)
+    messages = [
+        {
+            "role": "system",
+            "content": "你是一个专业的会议纪要助手，擅长从会议转写中提取关键信息并生成结构化纪要。请始终用中文回复。"
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    # --- 方案1: DeepSeek API ---
+    result = _call_deepseek_api(messages)
+    if result:
+        logger.info(f"DeepSeek API 生成成功 (模型: {config.deepseek_model})")
+        return result
+
+    # --- 方案2: Ollama ---
+    model = _check_ollama()
+    if model:
+        logger.info(f"Ollama 模型: {model}")
+        result = _call_ollama(model, messages)
+        if result:
+            return result
+
+    # --- 方案3: 离线兜底 ---
+    return _fallback_summary(transcript)
 
 
 def summarize_stream(transcript: str) -> Generator[str, None, None]:
-    """
-    流式生成会议纪要（用于实时展示）
-    """
+    """流式生成会议纪要"""
     config = get_config()
-    model = find_best_model()
+    prompt = build_summary_prompt(transcript)
+    messages = [
+        {"role": "system", "content": "你是一个专业的会议纪要助手。请始终用中文回复。"},
+        {"role": "user", "content": prompt},
+    ]
 
-    if not model:
-        yield f"❌ 未找到可用的 Ollama 模型。请安装: ollama pull {config.candidate_models[0]}"
+    # --- 方案1: DeepSeek API 流式 ---
+    if config.deepseek_api_key:
+        yield from _call_deepseek_api_stream(messages)
         return
 
-    prompt = build_summary_prompt(transcript)
+    # --- 方案2: Ollama ---
+    model = _check_ollama()
+    if model:
+        try:
+            import ollama
+            client = ollama.Client(host=config.ollama_host)
+            stream = client.chat(
+                model=model,
+                messages=messages,
+                options={"temperature": config.llm_temperature, "num_predict": config.llm_max_tokens},
+                stream=True,
+            )
+            for chunk in stream:
+                content = chunk.get("message", {}).get("content", "")
+                if content:
+                    yield content
+            return
+        except Exception as e:
+            yield f"\n[ERROR] Ollama 失败: {e}"
+            return
 
-    try:
-        client = ollama.Client(host=config.ollama_host)
-        stream = client.chat(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个专业的会议纪要助手。请始终用中文回复。"
-                },
-                {"role": "user", "content": prompt},
-            ],
-            options={
-                "temperature": config.llm_temperature,
-                "num_predict": config.llm_max_tokens,
-            },
-            stream=True,
-        )
-        for chunk in stream:
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                yield content
-
-    except Exception as e:
-        yield f"\n\n❌ LLM 服务异常: {e}"
+    yield "\n[WARN] 无可用的 LLM (请设置 DEEPSEEK_API_KEY 或启动 Ollama)"
 
 
 def extract_title(transcript: str) -> str:
-    """从转写文本中提取会议标题"""
-    config = get_config()
-    model = find_best_model()
-    if not model:
-        return "会议纪要"
-
+    """提取会议标题"""
     prompt = build_title_prompt(transcript)
-    try:
-        client = ollama.Client(host=config.ollama_host)
-        response = client.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": "你是一个助手，只需回复标题文本，不要添加引号或额外解释。"},
-                {"role": "user", "content": prompt},
-            ],
-            options={"temperature": 0.1, "num_predict": 50},
-        )
-        title = response["message"]["content"].strip().strip('"').strip("'").strip("《").strip("》")
-        return title[:30]  # 限制长度
-    except Exception:
-        return "会议纪要"
+    messages = [
+        {"role": "system", "content": "只需回复标题文本，不要引号或额外解释。"},
+        {"role": "user", "content": prompt},
+    ]
+
+    result = _call_deepseek_api(messages)
+    if result:
+        return result.strip().strip('"').strip("'").strip("《").strip("》")[:30]
+
+    model = _check_ollama()
+    if model:
+        result = _call_ollama(model, messages)
+        if result:
+            return result.strip().strip('"').strip("'").strip("《").strip("》")[:30]
+
+    return "会议纪要"
 
 
-def _fallback_summary(transcript: str, reason: str) -> str:
-    """
-    兜底方案：LLM 不可用时，返回基于规则的简单摘要
-    """
-    lines = transcript.strip().split("\n")
+def check_llm_available() -> tuple[bool, str]:
+    """综合检查: DeepSeek API > Ollama"""
+    config = get_config()
+    if config.deepseek_api_key:
+        return True, f"DeepSeek API ({config.deepseek_model})"
+    model = _check_ollama()
+    if model:
+        return True, f"Ollama ({model})"
+    return False, "请设置 DEEPSEEK_API_KEY 环境变量 或启动 Ollama"
+
+
+# ============================================================
+# 离线兜底
+# ============================================================
+def _fallback_summary(transcript: str) -> str:
+    """LLM 不可用时的离线摘要"""
     word_count = len(transcript)
+    lines = transcript.strip().split("\n")
 
     return f"""# 📋 会议纪要（离线模式）
 
-> ⚠️ **注意**: LLM 服务不可用 ({reason})，以下为基础文本提取结果。
+> ⚠️ 无可用的 LLM 服务，以下为基础转写结果。
 
 ---
 
-## 📝 转写文本统计
+## 📝 转写统计
 - 总字数: {word_count}
 - 行数: {len(lines)}
 
-## 🔍 关键段落（前 500 字）
-{transcript[:500]}{"..." if word_count > 500 else ""}
+## 🔍 关键段落（前 800 字）
+{transcript[:800]}{"..." if word_count > 800 else ""}
 
 ---
-
-> 💡 **提示**: 安装并启动 Ollama 后可自动生成智能纪要。
-> ```bash
-> # 安装 Ollama: https://ollama.com
-> ollama serve
-> ollama pull qwen3
-> ```
+> 💡 **启用智能摘要**: 设置环境变量 `DEEPSEEK_API_KEY=你的key` 即可使用 DeepSeek V4 Pro
 """

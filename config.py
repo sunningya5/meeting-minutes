@@ -3,6 +3,7 @@
 集中管理所有配置项，启动时由 app.py 调用 init_config()
 """
 
+import os
 from dataclasses import dataclass, field
 from utils.hardware import HardwareInfo, detect_hardware
 
@@ -19,28 +20,26 @@ class AppConfig:
 
     # --- 音频 ---
     target_sample_rate: int = 16000
-    segment_duration: int = 30     # 分段时长（秒）
-    segment_overlap: int = 2       # 段间重叠（秒）
-    max_file_size_mb: int = 500
+    segment_duration: int = 60      # 分段时长（秒）→ 从30提高到60，减少分段数
+    segment_overlap: int = 1        # 段间重叠（秒）→ 从2降到1
 
-    # --- LLM ---
-    ollama_host: str = "http://localhost:11434"
-    llm_model: str = ""            # 启动时自动检测
+    # --- DeepSeek API (V4 Pro 主模型) ---
+    deepseek_api_key: str = ""         # 从环境变量 DEEPSEEK_API_KEY 读取
+    deepseek_api_base: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"  # DeepSeek-V3/V4 模型
     llm_temperature: float = 0.3
-    llm_max_tokens: int = 2048
-    llm_timeout: int = 120         # 请求超时（秒）
+    llm_max_tokens: int = 4096
+    llm_timeout: int = 180
 
-    # --- 候选 LLM 模型（按优先级排列）---
-    # DeepSeek 系列优先，中文能力强
+    # --- Ollama (兜底方案) ---
+    ollama_host: str = "http://localhost:11434"
+    llm_model: str = ""
     candidate_models: tuple = (
-        "deepseek-r1:8b",       # DeepSeek-R1 8B (推荐)
-        "deepseek-r1:7b",       # DeepSeek-R1 7B
-        "deepseek-r1:14b",      # DeepSeek-R1 14B (需要更多显存)
-        "deepseek-r1:1.5b",     # DeepSeek-R1 轻量版
-        "deepseek-v3",          # DeepSeek-V3 (大模型)
-        "qwen3:latest",         # 兜底: Qwen3 系列
+        "deepseek-r1:8b",
+        "deepseek-r1:7b",
+        "deepseek-r1:14b",
+        "qwen3:latest",
         "qwen3:4b",
-        "qwen2.5:7b",
         "llama3.1:8b",
     )
 
@@ -49,6 +48,9 @@ class AppConfig:
             self.asr_device = self.hardware.device
         if not self.llm_model:
             self.llm_model = self.candidate_models[0]
+        # 从环境变量读取 API Key
+        if not self.deepseek_api_key:
+            self.deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "")
 
 
 # 全局单例

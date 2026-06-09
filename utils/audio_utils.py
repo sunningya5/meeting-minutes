@@ -12,14 +12,14 @@ import numpy as np
 import soundfile as sf
 
 # 支持的文件格式
-SUPPORTED_FORMATS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus")
+SUPPORTED_FORMATS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma")
 
 # SenseVoice 要求 16kHz 单声道
 TARGET_SAMPLE_RATE = 16000
 
-# 长音频分段参数
-SEGMENT_DURATION = 30      # 每段 30 秒
-SEGMENT_OVERLAP = 2        # 段间重叠 2 秒，避免截断
+# 长音频分段参数 (优化后: 60秒段，1秒重叠，减少分段数 = 更快)
+SEGMENT_DURATION = 60       # 每段 60 秒
+SEGMENT_OVERLAP = 1         # 段间重叠 1 秒
 
 
 def validate_audio(file_path: str) -> Tuple[bool, str]:
@@ -38,9 +38,7 @@ def validate_audio(file_path: str) -> Tuple[bool, str]:
     if file_size_mb == 0:
         return False, "文件为空"
 
-    if file_size_mb > 500:
-        return False, f"文件过大 ({file_size_mb:.0f} MB)，请上传小于 500MB 的文件"
-
+    # 不限制文件大小，大文件自动分段处理
     return True, ""
 
 
@@ -56,9 +54,15 @@ def get_audio_duration(file_path: str) -> float:
 def load_and_resample(file_path: str) -> Tuple[np.ndarray, int]:
     """
     加载音频并重采样到 16kHz 单声道
+    使用更快的 resample 引擎
     返回: (音频数据, 采样率)
     """
-    y, sr = librosa.load(file_path, sr=TARGET_SAMPLE_RATE, mono=True)
+    y, sr = librosa.load(
+        file_path,
+        sr=TARGET_SAMPLE_RATE,
+        mono=True,
+        res_type="kaiser_fast",  # 更快重采样
+    )
     return y, TARGET_SAMPLE_RATE
 
 
@@ -102,10 +106,7 @@ def save_temp_wav(y: np.ndarray, sr: int) -> str:
 
 def prepare_audio(file_path: str) -> Tuple[str, float, int]:
     """
-    完整的音频预处理流程:
-    1. 校验格式
-    2. 加载 + 重采样到 16kHz
-    3. 保存为临时 WAV
+    完整的音频预处理流程
     返回: (临时 WAV 路径, 时长秒, 分段数)
     """
     is_valid, err_msg = validate_audio(file_path)
@@ -115,8 +116,6 @@ def prepare_audio(file_path: str) -> Tuple[str, float, int]:
     y, sr = load_and_resample(file_path)
     duration = len(y) / sr
     segments = split_audio(y, sr)
-
-    # 只取第一段用于测试/预览，完整转写在外层循环处理
     wav_path = save_temp_wav(y, sr)
 
     return wav_path, duration, len(segments)
