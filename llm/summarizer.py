@@ -10,7 +10,7 @@ from typing import Optional, Generator
 import requests
 
 from config import get_config
-from prompts.templates import build_summary_prompt, build_title_prompt
+from prompts.templates import build_feishu_prompt, build_title_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -184,15 +184,20 @@ def _call_ollama(model: str, messages: list) -> Optional[str]:
 # ============================================================
 def summarize(transcript: str) -> str:
     """
-    生成会议纪要
+    生成飞书妙记风格会议纪要
     优先使用 DeepSeek API，不可用时使用 Ollama，再不行用离线兜底
     """
     config = get_config()
-    prompt = build_summary_prompt(transcript)
+    prompt = build_feishu_prompt(transcript)
     messages = [
         {
             "role": "system",
-            "content": "你是一个专业的会议纪要助手，擅长从会议转写中提取关键信息并生成结构化纪要。请始终用中文回复。"
+            "content": (
+                "你是一个顶级的会议纪要助手，产出质量对标飞书妙记。"
+                "你需要从会议转写中提取所有关键信息，生成结构清晰、细节丰富的纪要。"
+                "务必输出：智能摘要、关键词、章节速览、讨论要点、待办事项、会议全文。"
+                "始终使用中文，格式为干净的 Markdown。"
+            )
         },
         {"role": "user", "content": prompt},
     ]
@@ -216,11 +221,11 @@ def summarize(transcript: str) -> str:
 
 
 def summarize_stream(transcript: str) -> Generator[str, None, None]:
-    """流式生成会议纪要"""
+    """流式生成飞书妙记风格纪要"""
     config = get_config()
-    prompt = build_summary_prompt(transcript)
+    prompt = build_feishu_prompt(transcript)
     messages = [
-        {"role": "system", "content": "你是一个专业的会议纪要助手。请始终用中文回复。"},
+        {"role": "system", "content": "你是顶级会议纪要助手，对标飞书妙记。始终用中文，输出结构化Markdown。"},
         {"role": "user", "content": prompt},
     ]
 
@@ -291,21 +296,32 @@ def check_llm_available() -> tuple[bool, str]:
 def _fallback_summary(transcript: str) -> str:
     """LLM 不可用时的离线摘要"""
     word_count = len(transcript)
-    lines = transcript.strip().split("\n")
 
-    return f"""# 📋 会议纪要（离线模式）
+    return f"""# 会议纪要（离线模式）
 
-> ⚠️ 无可用的 LLM 服务，以下为基础转写结果。
-
----
-
-## 📝 转写统计
-- 总字数: {word_count}
-- 行数: {len(lines)}
-
-## 🔍 关键段落（前 800 字）
-{transcript[:800]}{"..." if word_count > 800 else ""}
+> ⚠️ LLM 暂不可用，以下为基础转写结果。设置 `DEEPSEEK_API_KEY` 环境变量即可启用智能纪要。
 
 ---
-> 💡 **启用智能摘要**: 设置环境变量 `DEEPSEEK_API_KEY=你的key` 即可使用 DeepSeek V4 Pro
+
+## 智能摘要
+（请配置 DeepSeek API Key 自动生成）
+
+## 关键词
+（自动提取）
+
+## 章节速览
+（自动分段）
+
+## 讨论要点
+（自动总结）
+
+## 待办事项
+（自动识别）
+
+## 会议全文
+
+{transcript[:2000]}{"..." if word_count > 2000 else ""}
+
+---
+> 总字数: {word_count} | 启用 DeepSeek V4 Pro: 设置环境变量 `DEEPSEEK_API_KEY`
 """

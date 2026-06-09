@@ -203,7 +203,7 @@ def create_ui() -> gr.Blocks:
         ---
         **使用提示**:
         - 首次运行自动下载 SenseVoice-Small 模型 (~893MB)，请耐心等待
-        - 使用 **DeepSeek V4 Pro API** 生成纪要，API Key 已配置在系统环境变量中
+        - 对标**飞书妙记** — 输出含智能摘要、关键词、章节速览、讨论要点、待办事项
         - 支持 MP3 / WAV / M4A / FLAC / OGG / AAC / WMA / OPUS，无文件大小限制
         """)
 

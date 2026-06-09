@@ -28,7 +28,7 @@ class AppConfig:
     deepseek_api_base: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"  # DeepSeek-V3/V4 模型
     llm_temperature: float = 0.3
-    llm_max_tokens: int = 4096
+    llm_max_tokens: int = 8192   # 妙记格式输出长，需要更多 tokens
     llm_timeout: int = 180
 
     # --- Ollama (兜底方案) ---
