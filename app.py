@@ -47,17 +47,10 @@ logger = logging.getLogger("meeting-minutes")
 # ============================================================
 # 核心处理函数
 # ============================================================
-def process_meeting(audio_file, deepseek_key, progress=gr.Progress()):
+def process_meeting(audio_file, progress=gr.Progress()):
     """
     完整处理流程: 上传 → 校验 → 转写 → 总结
     """
-    # 动态设置 API Key
-    if deepseek_key and deepseek_key.strip():
-        os.environ["DEEPSEEK_API_KEY"] = deepseek_key.strip()
-        # 刷新 config
-        cfg = get_config()
-        cfg.deepseek_api_key = deepseek_key.strip()
-
     if audio_file is None:
         yield "", "", "[WARN] 请先上传 MP3 录音文件"
         return
@@ -150,16 +143,6 @@ def create_ui() -> gr.Blocks:
         with gr.Accordion("系统状态", open=False):
             gr.Markdown(hw.summary() + "\n\nASR 模型: SenseVoice-Small | LLM: DeepSeek API")
 
-        # --- API Key ---
-        with gr.Row():
-            api_key_input = gr.Textbox(
-                label="DeepSeek API Key (可选，不填则使用 Ollama 本地模型)",
-                placeholder="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                type="password",
-                value=os.environ.get("DEEPSEEK_API_KEY", ""),
-                lines=1,
-            )
-
         # --- 上传区 ---
         with gr.Row():
             audio_input = gr.File(
@@ -203,7 +186,7 @@ def create_ui() -> gr.Blocks:
         # --- 绑定事件 ---
         process_btn.click(
             fn=process_meeting,
-            inputs=[audio_input, api_key_input],
+            inputs=[audio_input],
             outputs=[transcript_output, summary_output, status_output],
         )
 
@@ -212,8 +195,7 @@ def create_ui() -> gr.Blocks:
         ---
         **使用提示**:
         - 首次运行自动下载 SenseVoice-Small 模型 (~893MB)，请耐心等待
-        - 默认使用 **DeepSeek V4 Pro API** 生成纪要，填入 API Key 即可（获取: https://platform.deepseek.com/api_keys）
-        - 未填 API Key 时自动使用本地 Ollama 兜底
+        - 使用 **DeepSeek V4 Pro API** 生成纪要，API Key 已配置在系统环境变量中
         - 支持 MP3 / WAV / M4A / FLAC / OGG / AAC / WMA / OPUS，无文件大小限制
         """)
 

@@ -11,6 +11,7 @@ torch>=2.0.0
 torchaudio>=2.0.0
 
 # --- 音频处理 ---
+resampy>=0.4.0
 librosa>=0.10.0
 soundfile>=0.12.0
 pydub>=0.25.0
