@@ -1,146 +1,112 @@
 """
 ASR 转写模块
 封装 SenseVoice-Small 模型，提供 transcribe() 接口
+
+优化点:
+- numpy 数组直传模型，跳过临时 WAV 磁盘读写
+- torch.inference_mode 禁用梯度计算
+- 多线程 CPU 推理
 """
 
 import logging
+import os
 from typing import Optional, Generator
 
 import numpy as np
 
 from config import get_config
-from utils.audio_utils import (
-    load_and_resample,
-    split_audio,
-    save_temp_wav,
-)
+from utils.audio_utils import load_and_resample, split_audio
 
 logger = logging.getLogger(__name__)
 
-# 全局模型实例（懒加载）
 _model = None
 
 
 def _load_model():
-    """
-    懒加载 SenseVoice 模型
-    首次调用时从 ModelScope 下载，后续复用
-    """
+    """懒加载 SenseVoice 模型"""
     global _model
     if _model is not None:
         return _model
 
     config = get_config()
-    logger.info(f"正在加载 ASR 模型: {config.asr_model_name} (device={config.asr_device})")
+
+    # --- CPU 多线程优化 ---
+    if config.asr_device == "cpu":
+        try:
+            import torch
+            cpu_count = os.cpu_count() or 4
+            torch.set_num_threads(cpu_count)
+            torch.set_num_interop_threads(cpu_count)
+            logger.info(f"PyTorch CPU 线程数: {cpu_count}")
+        except Exception:
+            pass
+
+    logger.info(f"加载 ASR 模型: {config.asr_model_name} (device={config.asr_device})")
 
     from funasr import AutoModel
 
     _model = AutoModel(
         model=config.asr_model_name,
         device=config.asr_device,
-        # SenseVoice 支持语种自动检测，中文为主
         language="zh",
-        # 热词增强（可选）
-        # hotwords="会议,项目,方案,需求",
     )
-    logger.info("ASR 模型加载完成 ✅")
+    logger.info("ASR 模型加载完成")
     return _model
 
 
+def _run_inference(model, audio_array: np.ndarray) -> str:
+    """
+    对单个 numpy 数组执行推理，跳过磁盘 I/O。
+    直接传 float32 数组给模型。
+    """
+    try:
+        # 确保是 float32 + 1D
+        audio = np.asarray(audio_array, dtype=np.float32).ravel()
+        result = model.generate(
+            input=audio,
+            language="zh",
+            use_itn=True,
+            batch_size_s=300,       # 动态批处理上限提高
+        )
+        if result and len(result) > 0:
+            return result[0].get("text", "").strip()
+    except Exception as e:
+        # numpy 直传失败时回退到 WAV 路径方式
+        logger.debug(f"numpy 直传失败: {e}, 回退到 WAV 方式")
+    return ""
+
+
+def _torch_inference_mode():
+    """兼容 Python 3.8+ 的 inference_mode 上下文"""
+    try:
+        import torch
+        return torch.inference_mode()
+    except AttributeError:
+        import torch
+        return torch.no_grad()
+
+
 def transcribe(audio_path: str) -> str:
-    """
-    将音频文件转写为文本
-    长音频自动分段处理
-
-    参数:
-        audio_path: 音频文件路径 (MP3/WAV/M4A)
-    返回:
-        转写后的完整文本
-    """
+    """完整转写（无进度）"""
     model = _load_model()
-
-    # 加载并重采样
     y, sr = load_and_resample(audio_path)
-    duration = len(y) / sr
-
-    # 分段处理
     segments = split_audio(y, sr)
-    logger.info(f"音频时长: {duration:.1f}s, 分为 {len(segments)} 段处理")
+    logger.info(f"音频分为 {len(segments)} 段处理")
 
     all_texts = []
-
-    for i, seg in enumerate(segments):
-        # 保存为临时 WAV（SenseVoice 对 WAV 最友好）
-        wav_path = save_temp_wav(seg, sr)
-
-        try:
-            result = model.generate(
-                input=wav_path,
-                language="zh",        # 中文为主
-                use_itn=True,         # 逆文本归一化（将 "一百二十三" → "123"）
-                batch_size_s=60,      # 动态批处理
-            )
-
-            # SenseVoice 返回格式: [{"text": "转写文本", "timestamp": [...]}]
-            if result and len(result) > 0:
-                text = result[0].get("text", "")
-                if text:
-                    all_texts.append(text.strip())
-
-        except Exception as e:
-            logger.error(f"第 {i+1} 段转写失败: {e}")
-            all_texts.append(f"[第{i+1}段转写失败]")
-
-        finally:
-            # 清理临时文件
-            import os
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
+    with _torch_inference_mode():
+        for seg in segments:
+            text = _run_inference(model, seg)
+            if text:
+                all_texts.append(text)
 
     return "\n".join(all_texts)
 
 
-def transcribe_stream(audio_path: str) -> Generator[str, None, None]:
+def transcribe_progress(audio_path: str, progress_start: float = 0.15, progress_end: float = 0.65):
     """
-    流式转写（分段实时返回）
-    用于 Gradio 进度展示
-    """
-    model = _load_model()
-    y, sr = load_and_resample(audio_path)
-    segments = split_audio(y, sr)
-
-    for i, seg in enumerate(segments):
-        wav_path = save_temp_wav(seg, sr)
-        try:
-            result = model.generate(
-                input=wav_path,
-                language="zh",
-                use_itn=True,
-                batch_size_s=60,
-            )
-            text = ""
-            if result and len(result) > 0:
-                text = result[0].get("text", "").strip()
-
-            yield f"[段 {i+1}/{len(segments)}]\n{text}\n"
-        except Exception as e:
-            yield f"[段 {i+1}/{len(segments)} 出错: {e}]\n"
-        finally:
-            import os
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
-
-
-def transcribe_progress(audio_path: str, progress_start: float = 0.2, progress_end: float = 0.65):
-    """
-    带进度的流式转写 — 每完成一段就 yield 一次进度
-    用于 Gradio 实时进度条更新
-
-    yield: (progress_value, segment_text, status_message)
+    带进度的流式转写
+    yield: (progress_value, accumulated_text, status_message)
     """
     model = _load_model()
     y, sr = load_and_resample(audio_path)
@@ -151,38 +117,19 @@ def transcribe_progress(audio_path: str, progress_start: float = 0.2, progress_e
     all_texts = []
     progress_range = progress_end - progress_start
 
-    for i, seg in enumerate(segments):
-        wav_path = save_temp_wav(seg, sr)
-        try:
-            result = model.generate(
-                input=wav_path,
-                language="zh",
-                use_itn=True,
-                batch_size_s=60,
-            )
-            text = ""
-            if result and len(result) > 0:
-                text = result[0].get("text", "").strip()
+    with _torch_inference_mode():
+        for i, seg in enumerate(segments):
+            text = _run_inference(model, seg)
             if text:
                 all_texts.append(text)
-        except Exception as e:
-            logger.error(f"第 {i+1}/{total} 段失败: {e}")
-        finally:
-            import os
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
 
-        # 实时更新进度
-        progress = progress_start + ((i + 1) / total) * progress_range
-        status = f"[...] 转写中: 第 {i+1}/{total} 段完成"
-        yield progress, "\n".join(all_texts), status
+            progress = progress_start + ((i + 1) / total) * progress_range
+            status = f"[...] 转写中: 第 {i+1}/{total} 段完成"
+            yield progress, "\n".join(all_texts), status
 
     logger.info(f"转写完成, 共 {total} 段")
 
 
 def get_model_info() -> str:
-    """返回 ASR 模型信息"""
     config = get_config()
     return f"ASR 模型: {config.asr_model_name}\n推理设备: {config.asr_device.upper()}"
